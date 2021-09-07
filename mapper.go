@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
-	"net/http"
+	"os"
+	"strings"
 
 	"github.com/magiconair/properties"
 	"github.com/zemirco/keycloak"
@@ -17,20 +19,69 @@ type KeycloakSpec struct {
 	realm    string
 }
 
+var dryRunOnly = false
 var keycloakSpec KeycloakSpec
 var ctx context.Context
 var k *keycloak.Keycloak
 
-func main() {
-	p := properties.MustLoadFile("mapper.properties", properties.UTF8)
-	keycloakSpec = KeycloakSpec{}
-	keycloakSpec.server = p.GetString("keycloak.url", "localhost:8080")
-	keycloakSpec.user = p.GetString("keycloak.user", "admin")
-	keycloakSpec.password = p.GetString("keycloak.password", "password")
-	keycloakSpec.realm = p.GetString("keycloak.realm", "rhpam")
-	fmt.Printf("Keycloak specs: %+v\n", keycloakSpec)
+var missingRoles = []string{}
+var groupsWithMissingRole = map[string]string{}
 
-	// create your oauth configuration
+func main() {
+	initProps()
+	connectToKeycloak()
+	validateRealm()
+
+	prepareMapper()
+	printMapper()
+	if !dryRunOnly {
+		createRolesAndMappings()
+	} else {
+		fmt.Printf("\nNote: Disable or remove the %v option in %v to create the missing roles and mappings", PROPS_DRYRUN, PROPS_FILE_NAME)
+	}
+}
+
+const PROPS_FILE_NAME = "mapper.properties"
+const PROPS_DRYRUN = "dry.run.only"
+const PROPS_URL = "keycloak.url"
+const PROPS_USER = "keycloak.user"
+const PROPS_PASSWORD = "keycloak.password"
+const PROPS_REALM = "keycloak.realm"
+
+func templateProps() {
+	template := map[string]string{
+		PROPS_DRYRUN:   "false",
+		PROPS_URL:      "http://localhost:8080",
+		PROPS_USER:     "admin",
+		PROPS_PASSWORD: "password",
+		PROPS_REALM:    "realm",
+	}
+	p := properties.LoadMap(template)
+	f, _ := os.Create(PROPS_FILE_NAME)
+	w := bufio.NewWriter(f)
+	p.Write(w, properties.UTF8)
+	w.Flush()
+}
+
+func initProps() {
+	p, err := properties.LoadFile(PROPS_FILE_NAME, properties.UTF8)
+	if err != nil {
+		fmt.Printf("Missing properties file %s. Creating a default template for you\n", PROPS_FILE_NAME)
+		templateProps()
+		panic(err)
+	}
+	dryRunOnly = p.GetBool(PROPS_DRYRUN, false)
+	keycloakSpec = KeycloakSpec{}
+	keycloakSpec.server = p.MustGetString(PROPS_URL)
+	keycloakSpec.user = p.MustGetString(PROPS_USER)
+	keycloakSpec.password = p.MustGetString(PROPS_PASSWORD)
+	keycloakSpec.realm = p.MustGetString(PROPS_REALM)
+	fmt.Println("*** Running with ***")
+	fmt.Printf("Dry run only: %v\n", dryRunOnly)
+	fmt.Printf("Keycloak specs: %v\n", keycloakSpec)
+}
+
+func connectToKeycloak() {
 	config := oauth2.Config{
 		ClientID: "admin-cli",
 		Endpoint: oauth2.Endpoint{
@@ -38,40 +89,43 @@ func main() {
 		},
 	}
 
-	// get a valid token from keycloak
 	ctx = context.Background()
 	token, err := config.PasswordCredentialsToken(ctx, keycloakSpec.user, keycloakSpec.password)
 	if err != nil {
 		panic(err)
 	}
 
-	// create a new http client that uses the token on every request
 	client := config.Client(ctx, token)
-
-	// create a new keycloak instance and provide the http client
 	k, err = keycloak.NewKeycloak(client, keycloakSpec.server+"/auth/")
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println("Logged in as ", k)
+	fmt.Printf("Logged in to %v\n ", keycloakSpec.server)
+}
 
+func validateRealm() {
 	realm, _, err := k.Realms.Get(ctx, keycloakSpec.realm)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("realm: %+v\n", realm)
+	if realm.ID == nil {
+		panic(fmt.Sprintf("Provided realm '%s' is not configured", keycloakSpec.realm))
+	}
+	fmt.Printf("Found realm: %v\n", *realm.Realm)
+}
 
+func prepareMapper() {
 	groups, _, err := k.Groups.List(ctx, keycloakSpec.realm)
 	if err != nil {
 		panic(err)
 	}
 	for _, g := range groups {
-		checkGroup(g)
+		prepareMapperForGroup(g)
 	}
 }
 
-func checkGroup(group *keycloak.Group) {
-	fmt.Printf("Checking group: %v, %v\n", *group.Name, *group.ID)
+func prepareMapperForGroup(group *keycloak.Group) {
+	fmt.Printf("Preparing mapper for group: %v/%v\n", *group.Name, *group.ID)
 	g, _, err := k.Groups.Get(ctx, keycloakSpec.realm, *group.ID)
 	if err != nil {
 		panic(err)
@@ -80,70 +134,90 @@ func checkGroup(group *keycloak.Group) {
 	groupMapped := false
 	for _, r := range g.RealmRoles {
 		if r == *g.Name {
-			fmt.Printf("\tgroup-role already in for: %v\n", *g.Name)
+			fmt.Printf("\tRole %v is already mapped\n", *g.Name)
 			groupMapped = true
 			break
 		}
 	}
 
 	if !groupMapped {
-		fmt.Printf("\tgroup-role mapping is missing for: %v\n", *g.Name)
-		mappedRole, _, err := k.RealmRoles.GetByName(ctx, keycloakSpec.realm, *g.Name)
-		if err != nil {
-			panic(err)
-		}
+		fmt.Printf("\tRole mapping is missing for: %v\n", *g.Name)
+		mappedRole := getRoleGyName(*g.Name)
 		if mappedRole.ID == nil {
-			mappedRole = &keycloak.Role{Name: group.Name}
-			fmt.Printf("\tCreate missing role %v\n", *mappedRole.Name)
-			_, err := k.RealmRoles.Create(ctx, keycloakSpec.realm, mappedRole)
-			if err != nil {
-				panic(err)
-			}
-			mappedRole, _, err = k.RealmRoles.GetByName(ctx, keycloakSpec.realm, *g.Name)
-			if err != nil {
-				panic(err)
-			}
+			missingRoles = append(missingRoles, *g.Name)
 		} else {
-			fmt.Printf("\tMapping role exists: %v/%v\n", *mappedRole.ID, *mappedRole.Name)
+			fmt.Printf("\tMapping role already exists: %v/%v\n", *mappedRole.ID, *mappedRole.Name)
 		}
 
-		fmt.Printf("\tCreating mapping between group %v and role %v\n", *group.Name, *mappedRole.Name)
-		addRoleToGroup(group, mappedRole)
-		// } else {
-		// 	fmt.Printf("\tgroup-role mapping being removed: %v\n", *g.Name)
-		// 	mappedRole, _, err := k.RealmRoles.GetByName(ctx, keycloakSpec.realm, *g.Name)
-		// 	if err != nil {
-		// 		panic(err)
-		// 	}
-		// 	removeRoleFromGroup(group, mappedRole)
+		groupsWithMissingRole[*g.ID] = *g.Name
 	}
 
 	for _, subGroup := range group.SubGroups {
 		fmt.Printf("\tIterate on sub-group: %v\n", *subGroup.Name)
-		checkGroup(subGroup)
+		prepareMapperForGroup(subGroup)
 	}
 }
 
-func addRoleToGroup(group *keycloak.Group, role *keycloak.Role) (*http.Response, error) {
-	u := fmt.Sprintf("admin/realms/%s/groups/%s/role-mappings/realm", keycloakSpec.realm, *group.ID)
-	fmt.Println("Sending POST to", u)
-	roles := [1]*keycloak.Role{role}
-	req, err := k.NewRequest(http.MethodPost, u, roles)
+func printMapper() {
+	if anyConfigurationNeeded() {
+		fmt.Println("*** The following missing roles will be created ***")
+		for _, roleName := range missingRoles {
+			fmt.Printf("Role %v\n", roleName)
+		}
+		fmt.Println("*** The following mappings will be created ***")
+		for _, groupName := range groupsWithMissingRole {
+			fmt.Printf("Group %v to Role %v\n", groupName, groupName)
+		}
+	} else {
+		fmt.Println("*** All roles and mappings are already set, no changes needed ***")
+	}
+}
+
+func anyConfigurationNeeded() bool {
+	return len(missingRoles) > 0 || len(groupsWithMissingRole) > 0
+}
+
+func createRolesAndMappings() {
+	if anyConfigurationNeeded() {
+		reader := bufio.NewReader(os.Stdin)
+
+		fmt.Print("Do you really want to continue? (Y/N): ")
+		answer, _ := reader.ReadString('\n')
+
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(answer)), "Y") {
+			fmt.Println("*** Creating missing roles ***")
+			for _, roleName := range missingRoles {
+				createRoleByName(roleName)
+			}
+			fmt.Println("*** Creating missing mappings ***")
+			for groupID, groupName := range groupsWithMissingRole {
+				addRoleToGroup(groupID, getRoleGyName(groupName))
+			}
+		}
+	}
+}
+
+func createRoleByName(name string) {
+	role := &keycloak.Role{Name: &name}
+	fmt.Printf("Creating missing role %v\n", *role.Name)
+	_, err := k.RealmRoles.Create(ctx, keycloakSpec.realm, role)
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
-
-	return k.Do(ctx, req, nil)
 }
 
-// func removeRoleFromGroup(group *keycloak.Group, role *keycloak.Role) (*http.Response, error) {
-// 	u := fmt.Sprintf("admin/realms/%s/groups/%s/role-mappings/realm", keycloakSpec.realm, *group.ID)
-// 	fmt.Println("Sending DELETE to", u)
-// 	roles := [1]*keycloak.Role{role}
-// 	req, err := k.NewRequest(http.MethodDelete, u, roles)
-// 	if err != nil {
-// 		return nil, err
-// 	}
+func getRoleGyName(name string) *keycloak.Role {
+	role, _, err := k.RealmRoles.GetByName(ctx, keycloakSpec.realm, name)
+	if err != nil {
+		panic(err)
+	}
+	return role
+}
 
-// 	return k.Do(ctx, req, nil)
-// }
+func addRoleToGroup(groupID string, role *keycloak.Role) {
+	groupName := groupsWithMissingRole[groupID]
+	mappedRole := getRoleGyName(groupName)
+	fmt.Printf("Creating mapping between group %v and role %v/%v\n", groupName, *mappedRole.Name, *mappedRole.ID)
+	var mappedRoles = []*keycloak.Role{mappedRole}
+	k.Groups.AddRealmRoles(ctx, keycloakSpec.realm, groupID, mappedRoles)
+}
